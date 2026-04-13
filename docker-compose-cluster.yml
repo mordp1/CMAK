@@ -1,0 +1,160 @@
+services:
+
+  # ─── Kafka Broker 1 ──────────────────────────────────────────────────────────
+  kafka-1:
+    image: apache/kafka:4.1.1
+    hostname: kafka-1
+    container_name: kafka-1
+    ports:
+      - "9092:9092"      # external client access
+      - "9991:9999"      # JMX (host 9991 → container 9999)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka-1:29093,2@kafka-2:29093,3@kafka-3:29093'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka-1:29092,CONTROLLER://kafka-1:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka-1:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qr'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      # JMX: let JMX_PORT set both jmxremote.port and rmi.port automatically;
+      # only add hostname and disable auth/ssl in KAFKA_JMX_OPTS
+      JMX_PORT: 9999
+      KAFKA_JMX_OPTS: "-Dcom.sun.management.jmxremote=true -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Djava.rmi.server.hostname=kafka-1"
+
+  # ─── Kafka Broker 2 ──────────────────────────────────────────────────────────
+  kafka-2:
+    image: apache/kafka:4.1.1
+    hostname: kafka-2
+    container_name: kafka-2
+    ports:
+      - "9094:9094"
+      - "9992:9999"
+    environment:
+      KAFKA_NODE_ID: 2
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka-1:29093,2@kafka-2:29093,3@kafka-3:29093'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka-2:29092,CONTROLLER://kafka-2:29093,PLAINTEXT_HOST://0.0.0.0:9094'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka-2:29092,PLAINTEXT_HOST://localhost:9094'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qr'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      JMX_PORT: 9999
+      KAFKA_JMX_OPTS: "-Dcom.sun.management.jmxremote=true -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Djava.rmi.server.hostname=kafka-2"
+
+  # ─── Kafka Broker 3 ──────────────────────────────────────────────────────────
+  kafka-3:
+    image: apache/kafka:4.1.1
+    hostname: kafka-3
+    container_name: kafka-3
+    ports:
+      - "9096:9096"
+      - "9993:9999"
+    environment:
+      KAFKA_NODE_ID: 3
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka-1:29093,2@kafka-2:29093,3@kafka-3:29093'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka-3:29092,CONTROLLER://kafka-3:29093,PLAINTEXT_HOST://0.0.0.0:9096'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka-3:29092,PLAINTEXT_HOST://localhost:9096'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qr'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      JMX_PORT: 9999
+      KAFKA_JMX_OPTS: "-Dcom.sun.management.jmxremote=true -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Djava.rmi.server.hostname=kafka-3"
+
+  # ─── Create test topics for partition reassignment testing ───────────────────
+  kafka-init:
+    image: apache/kafka:4.1.1
+    container_name: kafka-init
+    depends_on:
+      - kafka-1
+      - kafka-2
+      - kafka-3
+    entrypoint: ['/bin/bash', '-c']
+    command:
+      - |
+        echo "Waiting for brokers to be ready..."
+        sleep 20
+
+        BS="kafka-1:29092,kafka-2:29092,kafka-3:29092"
+
+        echo "Creating topic 'orders' (6 partitions, RF=3)..."
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server $$BS --create \
+          --topic orders --partitions 6 --replication-factor 3 --if-not-exists
+
+        echo "Creating topic 'payments' (4 partitions, RF=3)..."
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server $$BS --create \
+          --topic payments --partitions 4 --replication-factor 3 --if-not-exists
+
+        echo "Creating topic 'events' (3 partitions, RF=2)..."
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server $$BS --create \
+          --topic events --partitions 3 --replication-factor 2 --if-not-exists
+
+        echo "Producing 20 messages to each topic..."
+        for i in $$(seq 1 20); do
+          echo "order-$$i" | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $$BS --topic orders
+          echo "payment-$$i" | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $$BS --topic payments
+          echo "event-$$i" | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $$BS --topic events
+        done
+
+        echo ""
+        echo "=== Topic layout ==="
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server $$BS --describe --topic orders
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server $$BS --describe --topic payments
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server $$BS --describe --topic events
+        echo "=== Done ==="
+
+  # ─── CMAK ────────────────────────────────────────────────────────────────────
+  cmak:
+    image: cmak:3.0.1
+    container_name: cmak
+    ports:
+      - "9000:9000"
+    environment:
+      ZK_HOSTS: "kafka-1:29092"          # not used in KRaft — bootstrap servers set per-cluster in UI
+      APPLICATION_SECRET: "change-me-in-production"
+      CMAK_CLUSTER_CONFIG_FILE: /opt/cmak-data/cmak-clusters.json
+    volumes:
+      - cmak-data:/opt/cmak-data
+    depends_on:
+      - kafka-1
+      - kafka-2
+      - kafka-3
+
+  # ─── Kafbat UI (visual aid) ──────────────────────────────────────────────────
+  kafbat-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.4.2
+    container_name: kafbat-ui
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: kafka-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-1:29092,kafka-2:29092,kafka-3:29092
+    depends_on:
+      - kafka-1
+      - kafka-2
+      - kafka-3
+
+volumes:
+  cmak-data:

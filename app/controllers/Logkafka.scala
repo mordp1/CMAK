@@ -205,6 +205,7 @@ class Logkafka (val cc: ControllerComponents, val kafkaManagerContext: KafkaMana
           case Kafka_3_1_0 => (defaultCreateForm.fill(kafka_3_1_0_Default), clusterContext)
           case Kafka_3_1_1 => (defaultCreateForm.fill(kafka_3_1_1_Default), clusterContext)
           case Kafka_3_2_0 => (defaultCreateForm.fill(kafka_3_2_0_Default), clusterContext)
+          case _ => (defaultCreateForm.fill(kafka_3_2_0_Default), clusterContext)
         }
       }
     }
@@ -325,6 +326,7 @@ class Logkafka (val cc: ControllerComponents, val kafkaManagerContext: KafkaMana
       case Kafka_3_1_0 => LogkafkaNewConfigs.configNames(Kafka_3_1_0).map(n => (n,LKConfig(n,None))).toMap
       case Kafka_3_1_1 => LogkafkaNewConfigs.configNames(Kafka_3_1_1).map(n => (n,LKConfig(n,None))).toMap
       case Kafka_3_2_0 => LogkafkaNewConfigs.configNames(Kafka_3_2_0).map(n => (n,LKConfig(n,None))).toMap
+      case _ => LogkafkaNewConfigs.configNames(Kafka_3_2_0).map(n => (n,LKConfig(n,None))).toMap
     }
     val identityOption = li.identityMap.get(log_path)
     if (identityOption.isDefined) {

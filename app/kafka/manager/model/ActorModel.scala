@@ -182,6 +182,8 @@ object ActorModel {
   case class KSUpdatePreferredLeaderElection(millis: Long, json: String) extends CommandRequest
   case class KSEndReassignPartition(millis: Long) extends CommandRequest
   case class KSUpdateReassignPartition(millis: Long, json: String) extends CommandRequest
+  case class KSSetReassignPartitions(partitionsToBeReassigned: Map[org.apache.kafka.common.TopicPartition, Seq[Int]]) extends CommandRequest
+  case object KSPollKafkaState extends CommandRequest
 
   case object KSGetBrokers extends KSRequest
   case class KSGetBrokerState(id: String) extends  KSRequest

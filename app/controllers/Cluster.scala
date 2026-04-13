@@ -45,9 +45,9 @@ class Cluster (val cc: ControllerComponents, val kafkaManagerContext: KafkaManag
     }
   }
 
-  val validateZkHosts : Constraint[String] = Constraint("validate zookeeper hosts") { zkHosts =>
+  val validateBootstrapServers : Constraint[String] = Constraint("validate bootstrap servers") { bootstrapServers =>
     Try {
-      ClusterConfig.validateZkHosts(zkHosts)
+      ClusterConfig.validateBootstrapServers(bootstrapServers)
     } match {
       case Failure(t) => Invalid(t.getMessage)
       case Success(_) => Valid
@@ -92,8 +92,7 @@ class Cluster (val cc: ControllerComponents, val kafkaManagerContext: KafkaManag
     mapping(
       "name" -> nonEmptyText.verifying(maxLength(250), validateName)
       , "kafkaVersion" -> nonEmptyText.verifying(validateKafkaVersion)
-      , "zkHosts" -> nonEmptyText.verifying(validateZkHosts)
-      , "zkMaxRetry" -> ignored(100 : Int)
+      , "bootstrapServers" -> nonEmptyText.verifying(validateBootstrapServers)
       , "jmxEnabled" -> boolean
       , "jmxUser" -> optional(text)
       , "jmxPass" -> optional(text)
@@ -136,8 +135,7 @@ class Cluster (val cc: ControllerComponents, val kafkaManagerContext: KafkaManag
       "operation" -> nonEmptyText.verifying(validateOperation),
       "name" -> nonEmptyText.verifying(maxLength(250), validateName),
       "kafkaVersion" -> nonEmptyText.verifying(validateKafkaVersion),
-      "zkHosts" -> nonEmptyText.verifying(validateZkHosts),
-      "zkMaxRetry" -> ignored(100 : Int),
+      "bootstrapServers" -> nonEmptyText.verifying(validateBootstrapServers),
       "jmxEnabled" -> boolean,
       "jmxUser" -> optional(text),
       "jmxPass" -> optional(text),
@@ -178,7 +176,7 @@ class Cluster (val cc: ControllerComponents, val kafkaManagerContext: KafkaManag
   private[this] val defaultClusterConfig : ClusterConfig = {
     ClusterConfig(
       ""
-      ,CuratorConfig("")
+      ,""
       ,false
       ,KafkaVersion.supportedVersions.values.toList.sortBy(_.toString).last
       ,false
@@ -194,6 +192,7 @@ class Cluster (val cc: ControllerComponents, val kafkaManagerContext: KafkaManag
       ,PLAINTEXT
       ,None
       ,None
+      ,9999
     )
   }
 
@@ -324,8 +323,7 @@ class Cluster (val cc: ControllerComponents, val kafkaManagerContext: KafkaManag
             Update.toString,
             cc.name,
             cc.version.toString,
-            cc.curatorConfig.zkConnect,
-            cc.curatorConfig.zkMaxRetry,
+            cc.bootstrapServers,
             cc.jmxEnabled,
             cc.jmxUser,
             cc.jmxPass,
@@ -353,7 +351,7 @@ class Cluster (val cc: ControllerComponents, val kafkaManagerContext: KafkaManag
         clusterConfig => {
           kafkaManager.addCluster(clusterConfig.name,
             clusterConfig.version.toString,
-            clusterConfig.curatorConfig.zkConnect,
+            clusterConfig.bootstrapServers,
             clusterConfig.jmxEnabled,
             clusterConfig.jmxUser,
             clusterConfig.jmxPass,
@@ -424,7 +422,7 @@ class Cluster (val cc: ControllerComponents, val kafkaManagerContext: KafkaManag
             kafkaManager.updateCluster(
               clusterOperation.clusterConfig.name,
               clusterOperation.clusterConfig.version.toString,
-              clusterOperation.clusterConfig.curatorConfig.zkConnect,
+              clusterOperation.clusterConfig.bootstrapServers,
               clusterOperation.clusterConfig.jmxEnabled,
               clusterOperation.clusterConfig.jmxUser,
               clusterOperation.clusterConfig.jmxPass,

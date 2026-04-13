@@ -5,35 +5,34 @@
 
 package kafka.manager.actor
 
+import java.io.{File, PrintWriter}
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, StandardCopyOption}
 import java.util.Properties
 import java.util.concurrent.{LinkedBlockingQueue, ThreadPoolExecutor, TimeUnit}
 
 import akka.actor.{ActorPath, Props}
 import akka.pattern._
 import kafka.manager.actor.cluster.{ClusterManagerActor, ClusterManagerActorConfig}
-import kafka.manager.base.{LongRunningPoolConfig, BaseZkPath, CuratorAwareActor, BaseQueryCommandActor}
-import kafka.manager.model.{ClusterTuning, ClusterConfig, CuratorConfig}
+import kafka.manager.base.{LongRunningPoolConfig, BaseQueryCommandActor}
+import kafka.manager.model.{ClusterTuning, ClusterConfig}
 import kafka.manager.model.ActorModel.CMShutdown
-import kafka.manager.utils.ZkUtils
-import org.apache.curator.framework.CuratorFramework
-import org.apache.curator.framework.recipes.cache.PathChildrenCache.StartMode
-import org.apache.curator.framework.recipes.cache.{PathChildrenCache, PathChildrenCacheEvent, PathChildrenCacheListener}
-import org.apache.curator.framework.recipes.locks.InterProcessSemaphoreMutex
-import org.apache.zookeeper.CreateMode
+import org.json4s._
+import org.json4s.jackson.JsonMethods._
+import org.json4s.jackson.Serialization
 
 import scala.concurrent.duration.FiniteDuration
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success, Try}
 
 /**
- * @author hiral
+ * Kafka Manager Actor — KRaft edition.
+ * Cluster configurations are persisted to a local JSON file instead of ZooKeeper.
  */
 
 object KafkaManagerActor {
+  // kept for backward compat references; no longer a ZK path
   val ZkRoot : String = "/kafka-manager"
-
-  def getClusterPath(config: ClusterConfig) : String = s"$ZkRoot/${config.name}"
-
 }
 
 import kafka.manager.model.ActorModel._
@@ -41,12 +40,10 @@ import kafka.manager.model.ActorModel._
 import scala.collection.JavaConverters._
 import scala.concurrent.duration._
 
-case class KafkaManagerActorConfig(curatorConfig: CuratorConfig
-                                   , baseZkPath : String = KafkaManagerActor.ZkRoot
+case class KafkaManagerActorConfig(clusterConfigFile: String
                                    , pinnedDispatcherName : String = "pinned-dispatcher"
                                    , startDelayMillis: Long = 1000
                                    , threadPoolSize: Int = 2
-                                   , mutexTimeoutMillis: Int = 4000
                                    , maxQueueSize: Int = 100
                                    , kafkaManagerUpdatePeriod: FiniteDuration = 10 seconds
                                    , deleteClusterUpdatePeriod: FiniteDuration = 10 seconds
@@ -56,37 +53,11 @@ case class KafkaManagerActorConfig(curatorConfig: CuratorConfig
                                    , defaultTuning: ClusterTuning
                                    , consumerProperties: Option[Properties]
                                   )
+
 class KafkaManagerActor(kafkaManagerConfig: KafkaManagerActorConfig)
-  extends BaseQueryCommandActor with CuratorAwareActor with BaseZkPath {
+  extends BaseQueryCommandActor {
 
-  //this is for baze zk path trait
-  override def baseZkPath : String = kafkaManagerConfig.baseZkPath
-
-  //this is for curator aware actor
-  override def curatorConfig: CuratorConfig = kafkaManagerConfig.curatorConfig
-  
-  private[this] val baseClusterZkPath = zkPath("clusters")
-  private[this] val configsZkPath = zkPath("configs")
-  private[this] val deleteClustersZkPath = zkPath("deleteClusters")
-
-  log.info(s"zk=${kafkaManagerConfig.curatorConfig.zkConnect}")
-  log.info(s"baseZkPath=$baseZkPath")
-
-  //create kafka manager base path
-  Try(curator.create().creatingParentsIfNeeded().withMode(CreateMode.PERSISTENT).forPath(baseZkPath))
-  require(curator.checkExists().forPath(baseZkPath) != null,s"Kafka manager base path not found : $baseZkPath")
-
-  //create kafka manager base clusters path
-  Try(curator.create().creatingParentsIfNeeded().withMode(CreateMode.PERSISTENT).forPath(baseClusterZkPath))
-  require(curator.checkExists().forPath(baseClusterZkPath) != null,s"Kafka manager base clusters path not found : $baseClusterZkPath")
-
-  //create kafka manager delete clusters path
-  Try(curator.create().creatingParentsIfNeeded().withMode(CreateMode.PERSISTENT).forPath(deleteClustersZkPath))
-  require(curator.checkExists().forPath(deleteClustersZkPath) != null,s"Kafka manager delete clusters path not found : $deleteClustersZkPath")
-
-  //create kafka manager configs path
-  Try(curator.create().creatingParentsIfNeeded().withMode(CreateMode.PERSISTENT).forPath(configsZkPath))
-  require(curator.checkExists().forPath(configsZkPath) != null,s"Kafka manager configs path not found : $configsZkPath")
+  private[this] val configFile = new File(kafkaManagerConfig.clusterConfigFile)
 
   private[this] val longRunningExecutor = new ThreadPoolExecutor(
     kafkaManagerConfig.threadPoolSize,
@@ -97,121 +68,96 @@ class KafkaManagerActor(kafkaManagerConfig: KafkaManagerActorConfig)
 
   private[this] val longRunningExecutionContext = ExecutionContext.fromExecutor(longRunningExecutor)
 
-  private[this] val kafkaManagerPathCache = new PathChildrenCache(curator,configsZkPath,true)
-
-  private[this] val mutex = new InterProcessSemaphoreMutex(curator, zkPath("mutex"))
-
-  private[this] val dcProps = {
-    val dcConfig = DeleteClusterActorConfig(
-      curator,
-      deleteClustersZkPath,
-      baseClusterZkPath,
-      configsZkPath,
-      kafkaManagerConfig.deleteClusterUpdatePeriod,
-      kafkaManagerConfig.deletionBatchSize)
-    Props(classOf[DeleteClusterActor],dcConfig)
-  }
-
-  private[this] val deleteClustersActor: ActorPath = context.actorOf(dcProps.withDispatcher(kafkaManagerConfig.pinnedDispatcherName),"delete-cluster").path
-
-  private[this] val deleteClustersPathCache = new PathChildrenCache(curator,deleteClustersZkPath,true)
-
-  private[this] val pathCacheListener = new PathChildrenCacheListener {
-    override def childEvent(client: CuratorFramework, event: PathChildrenCacheEvent): Unit = {
-      log.debug(s"Got event : ${event.getType} path=${Option(event.getData).map(_.getPath)}")
-      event.getType match {
-        case PathChildrenCacheEvent.Type.CONNECTION_RECONNECTED =>
-          self ! KMUpdateState
-          self ! KMPruneClusters
-        case PathChildrenCacheEvent.Type.CHILD_ADDED |
-             PathChildrenCacheEvent.Type.CHILD_UPDATED =>
-          self ! KMUpdateState
-        case PathChildrenCacheEvent.Type.CHILD_REMOVED =>
-          self ! KMPruneClusters
-        case _ => //don't care
-      }
-    }
-  }
-
   private[this] var lastUpdateMillis: Long = 0L
-
   private[this] var clusterManagerMap : Map[String,ActorPath] = Map.empty
   private[this] var clusterConfigMap : Map[String,ClusterConfig] = Map.empty
   private[this] var pendingClusterConfigMap : Map[String,ClusterConfig] = Map.empty
+  // cluster names pending deletion
+  private[this] var deletingClusters : Set[String] = Set.empty
 
-  private[this] def modify(fn: => Any) : Unit = {
-    if(longRunningExecutor.getQueue.remainingCapacity() == 0) {
-      Future.successful(KMCommandResult(Try(throw new UnsupportedOperationException("Long running executor blocking queue is full!"))))
-    } else {
-      implicit val ec = longRunningExecutionContext
-      Future {
-        try {
-          log.debug(s"Acquiring kafka manager mutex...")
-          if(mutex.acquire(kafkaManagerConfig.mutexTimeoutMillis,TimeUnit.MILLISECONDS)) {
-            KMCommandResult(Try {
-              fn
-            })
-          } else {
-            throw new RuntimeException("Failed to acquire lock for kafka manager command")
-          }
-        } finally {
-          if(mutex.isAcquiredInThisProcess) {
-            log.debug(s"Releasing kafka manger mutex...")
-            mutex.release()
-          }
-        }
-      } pipeTo sender()
+  // --- File persistence ---
+
+  private[this] def loadClustersFromFile(): Map[String, ClusterConfig] = {
+    if (!configFile.exists()) {
+      log.info(s"Cluster config file not found, starting with empty registry: ${configFile.getAbsolutePath}")
+      return Map.empty
+    }
+    Try {
+      val json = new String(Files.readAllBytes(configFile.toPath), StandardCharsets.UTF_8)
+      val parsed = parse(json)
+      parsed match {
+        case JArray(list) =>
+          list.flatMap { item =>
+            ClusterConfig.deserialize(compact(render(item)).getBytes(StandardCharsets.UTF_8)) match {
+              case Success(cc) => Some(cc.name -> cc)
+              case Failure(t) =>
+                log.error(s"Failed to deserialize cluster config from file: $t")
+                None
+            }
+          }.toMap[String, ClusterConfig]
+        case _ =>
+          log.error("Cluster config file does not contain a JSON array")
+          Map.empty[String, ClusterConfig]
+      }
+    } match {
+      case Success(m) => m
+      case Failure(t) =>
+        log.error(s"Failed to read cluster config file: $t")
+        Map.empty
     }
   }
 
+  private[this] def persistClusters(): Unit = {
+    Try {
+      val configs = clusterConfigMap.values.toList
+      val jsonStr = "[" + configs.map { cc =>
+        new String(ClusterConfig.serialize(cc), StandardCharsets.UTF_8)
+      }.mkString(",") + "]"
+      val tmpFile = new File(configFile.getAbsolutePath + ".tmp")
+      configFile.getParentFile.mkdirs()
+      val pw = new PrintWriter(tmpFile, "UTF-8")
+      try { pw.print(jsonStr) } finally { pw.close() }
+      Files.move(tmpFile.toPath, configFile.toPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+    } match {
+      case Failure(t) => log.error(s"Failed to persist cluster configs: $t")
+      case _ =>
+    }
+  }
+
+  // --- Actor lifecycle ---
+
   @scala.throws[Exception](classOf[Exception])
-  override def preStart() = {
+  override def preStart(): Unit = {
     super.preStart()
+    log.info(s"Started actor ${self.path}, cluster config file: ${configFile.getAbsolutePath}")
 
-    import scala.concurrent.duration._
-    log.info("Started actor %s".format(self.path))
-
-    log.info("Starting delete clusters path cache...")
-    deleteClustersPathCache.start(StartMode.BUILD_INITIAL_CACHE)
-
-    log.info("Starting kafka manager path cache...")
-    kafkaManagerPathCache.start(StartMode.BUILD_INITIAL_CACHE)
-
-    log.info("Adding kafka manager path cache listener...")
-    kafkaManagerPathCache.getListenable.addListener(pathCacheListener)
+    // Load initial cluster state from file
+    val loaded = loadClustersFromFile()
+    loaded.values.foreach { cc =>
+      val configWithDefaults = getConfigWithDefaults(cc, kafkaManagerConfig)
+      addCluster(configWithDefaults)
+    }
+    lastUpdateMillis = System.currentTimeMillis()
 
     implicit val ec = longRunningExecutionContext
-    //schedule periodic forced update
     context.system.scheduler.schedule(
-      Duration(kafkaManagerConfig.startDelayMillis,TimeUnit.MILLISECONDS),kafkaManagerConfig.kafkaManagerUpdatePeriod) {
+      Duration(kafkaManagerConfig.startDelayMillis, TimeUnit.MILLISECONDS),
+      kafkaManagerConfig.kafkaManagerUpdatePeriod) {
       self ! KMUpdateState
     }
   }
 
   @scala.throws[Exception](classOf[Exception])
-  override def preRestart(reason: Throwable, message: Option[Any]) {
+  override def preRestart(reason: Throwable, message: Option[Any]): Unit = {
     log.error(reason, "Restarting due to [{}] when processing [{}]",
       reason.getMessage, message.getOrElse(""))
     super.preRestart(reason, message)
   }
 
-
   @scala.throws[Exception](classOf[Exception])
   override def postStop(): Unit = {
-    log.info("Stopped actor %s".format(self.path))
-
-    log.info("Removing kafka manager path cache listener...")
-    Try(kafkaManagerPathCache.getListenable.removeListener(pathCacheListener))
-
-    log.info("Shutting down long running executor...")
+    log.info(s"Stopped actor ${self.path}")
     Try(longRunningExecutor.shutdown())
-
-    log.info("Shutting down kafka manager path cache...")
-    Try(kafkaManagerPathCache.close())
-
-    log.info("Shutting down delete clusters path cache...")
-    Try(deleteClustersPathCache.close())
-
     super.postStop()
   }
 
@@ -221,7 +167,6 @@ class KafkaManagerActor(kafkaManagerConfig: KafkaManagerActorConfig)
     }
   }
 
-  
   override def processQueryRequest(request: QueryRequest): Unit = {
     request match {
       case KMGetActiveClusters =>
@@ -231,7 +176,8 @@ class KafkaManagerActor(kafkaManagerConfig: KafkaManagerActorConfig)
         sender ! KMClusterList(clusterConfigMap.values.toIndexedSeq, pendingClusterConfigMap.values.toIndexedSeq)
 
       case KSGetScheduleLeaderElection =>
-        sender ! ZkUtils.readDataMaybeNull(curator, ZkUtils.SchedulePreferredLeaderElectionPath)._1.getOrElse("{}")
+        // No ZK-based scheduled leader election in KRaft mode
+        sender ! "{}"
 
       case KMGetClusterConfig(name) =>
         sender ! KMClusterConfigResult(Try {
@@ -247,111 +193,101 @@ class KafkaManagerActor(kafkaManagerConfig: KafkaManagerActorConfig)
           clusterManagerPath:ActorPath =>
             context.actorSelection(clusterManagerPath).forward(request)
         }
-        
+
       case any: Any => log.warning("kma : processQueryRequest : Received unknown message: {}", any)
     }
-    
   }
 
   override def processCommandRequest(request: CommandRequest): Unit = {
     request match {
       case KMAddCluster(clusterConfig) =>
-        modify {
-          val data: Array[Byte] = ClusterConfig.serialize(clusterConfig)
-          val zkpath: String = getConfigsZkPath(clusterConfig)
-          require(!(clusterConfig.displaySizeEnabled && !clusterConfig.jmxEnabled),
-            "Display topic and broker size can only be enabled when JMX is enabled")
-          require(!(clusterConfig.filterConsumers && !clusterConfig.pollConsumers),
-            "Filter consumers can only be enabled when consumer polling is enabled")
-          require(kafkaManagerPathCache.getCurrentData(zkpath) == null,
-            s"Cluster already exists : ${clusterConfig.name}")
-          require(deleteClustersPathCache.getCurrentData(getDeleteClusterZkPath(clusterConfig.name)) == null,
-            s"Cluster is marked for deletion : ${clusterConfig.name}")
-          log.debug(s"Creating new config node $zkpath")
-          curator.create().creatingParentsIfNeeded().withMode(CreateMode.PERSISTENT).forPath(zkpath, data)
-        }
+        implicit val ec = longRunningExecutionContext
+        Future {
+          KMCommandResult(Try {
+            require(!(clusterConfig.displaySizeEnabled && !clusterConfig.jmxEnabled),
+              "Display topic and broker size can only be enabled when JMX is enabled")
+            require(!(clusterConfig.filterConsumers && !clusterConfig.pollConsumers),
+              "Filter consumers can only be enabled when consumer polling is enabled")
+            require(!clusterConfigMap.contains(clusterConfig.name),
+              s"Cluster already exists : ${clusterConfig.name}")
+            require(!deletingClusters.contains(clusterConfig.name),
+              s"Cluster is marked for deletion : ${clusterConfig.name}")
+            val withDefaults = getConfigWithDefaults(clusterConfig, kafkaManagerConfig)
+            clusterConfigMap += (withDefaults.name -> withDefaults)
+            persistClusters()
+            addCluster(withDefaults)
+          })
+        } pipeTo sender()
 
       case KMUpdateCluster(clusterConfig) =>
-        modify {
-          val data: Array[Byte] = ClusterConfig.serialize(clusterConfig)
-          val zkpath: String = getConfigsZkPath(clusterConfig)
-          require(!(clusterConfig.displaySizeEnabled && !clusterConfig.jmxEnabled),
-            "Display topic and broker size can only be enabled when JMX is enabled")
-          require(!(clusterConfig.filterConsumers && !clusterConfig.pollConsumers),
-            "Filter consumers can only be enabled when consumer polling is enabled")
-          require(deleteClustersPathCache.getCurrentData(getDeleteClusterZkPath(clusterConfig.name)) == null,
-            s"Cluster is marked for deletion : ${clusterConfig.name}")
-          require(kafkaManagerPathCache.getCurrentData(zkpath) != null,
-            s"Cannot update non-existing cluster : ${clusterConfig.name}")
-          curator.setData().forPath(zkpath, data)
-        }
+        implicit val ec = longRunningExecutionContext
+        Future {
+          KMCommandResult(Try {
+            require(!(clusterConfig.displaySizeEnabled && !clusterConfig.jmxEnabled),
+              "Display topic and broker size can only be enabled when JMX is enabled")
+            require(!(clusterConfig.filterConsumers && !clusterConfig.pollConsumers),
+              "Filter consumers can only be enabled when consumer polling is enabled")
+            require(!deletingClusters.contains(clusterConfig.name),
+              s"Cluster is marked for deletion : ${clusterConfig.name}")
+            require(clusterConfigMap.contains(clusterConfig.name),
+              s"Cannot update non-existing cluster : ${clusterConfig.name}")
+            val withDefaults = getConfigWithDefaults(clusterConfig, kafkaManagerConfig)
+            val current = clusterConfigMap(withDefaults.name)
+            clusterConfigMap += (withDefaults.name -> withDefaults)
+            persistClusters()
+            updateCluster(current, withDefaults)
+          })
+        } pipeTo sender()
 
       case KMDisableCluster(clusterName) =>
-        modify {
-
-          val existingConfigOption = clusterConfigMap.get(clusterName)
-          require(existingConfigOption.isDefined, s"Cannot disable non-existing cluster : $clusterName")
-
-          require(deleteClustersPathCache.getCurrentData(getDeleteClusterZkPath(clusterName)) == null,
-            s"Cluster is marked for deletion : $clusterName")
-
-          for {
-            existingConfig <- existingConfigOption
-          } yield {
-            val disabledConfig = existingConfig.copy(enabled = false)
-            val data: Array[Byte] = ClusterConfig.serialize(disabledConfig)
-            val zkpath = getConfigsZkPath(existingConfig)
-            require(kafkaManagerPathCache.getCurrentData(zkpath) != null,
-              s"Cannot disable non-existing cluster : $clusterName")
-            curator.setData().forPath(zkpath, data)
-          }
-        }
+        implicit val ec = longRunningExecutionContext
+        Future {
+          KMCommandResult(Try {
+            val existingConfigOption = clusterConfigMap.get(clusterName)
+            require(existingConfigOption.isDefined, s"Cannot disable non-existing cluster : $clusterName")
+            require(!deletingClusters.contains(clusterName), s"Cluster is marked for deletion : $clusterName")
+            existingConfigOption.foreach { existingConfig =>
+              val disabledConfig = existingConfig.copy(enabled = false)
+              clusterConfigMap += (clusterName -> disabledConfig)
+              persistClusters()
+              updateCluster(existingConfig, disabledConfig)
+            }
+          })
+        } pipeTo sender()
 
       case KMEnableCluster(clusterName) =>
-        modify {
-          val existingManagerOption = clusterManagerMap.get(clusterName)
-          require(existingManagerOption.isEmpty, s"Cannot enable already enabled cluster : $clusterName")
-
-          val existingConfigOption = clusterConfigMap.get(clusterName)
-          require(existingConfigOption.isDefined, s"Cannot enable non-existing cluster : $clusterName")
-
-          require(deleteClustersPathCache.getCurrentData(getDeleteClusterZkPath(clusterName)) == null,
-            s"Cluster is marked for deletion : $clusterName")
-
-          for {
-            existingConfig <- existingConfigOption
-          } yield {
-            val enabledConfig = existingConfig.copy(enabled = true)
-            val data: Array[Byte] = ClusterConfig.serialize(enabledConfig)
-            val zkpath = getConfigsZkPath(existingConfig)
-            require(kafkaManagerPathCache.getCurrentData(zkpath) != null,
-              s"Cannot enable non-existing cluster : $clusterName")
-            curator.setData().forPath(zkpath, data)
-          }
-        }
+        implicit val ec = longRunningExecutionContext
+        Future {
+          KMCommandResult(Try {
+            val existingManagerOption = clusterManagerMap.get(clusterName)
+            require(existingManagerOption.isEmpty, s"Cannot enable already enabled cluster : $clusterName")
+            val existingConfigOption = clusterConfigMap.get(clusterName)
+            require(existingConfigOption.isDefined, s"Cannot enable non-existing cluster : $clusterName")
+            require(!deletingClusters.contains(clusterName), s"Cluster is marked for deletion : $clusterName")
+            existingConfigOption.foreach { existingConfig =>
+              val enabledConfig = existingConfig.copy(enabled = true)
+              clusterConfigMap += (clusterName -> enabledConfig)
+              persistClusters()
+              updateCluster(existingConfig, enabledConfig)
+            }
+          })
+        } pipeTo sender()
 
       case KMDeleteCluster(clusterName) =>
-        modify {
-          val existingManagerOption = clusterManagerMap.get(clusterName)
-          require(existingManagerOption.isEmpty, s"Cannot delete enabled cluster : $clusterName")
-
-          val existingConfigOption = clusterConfigMap.get(clusterName)
-          require(existingConfigOption.isDefined, s"Cannot delete non-existing cluster : $clusterName")
-
-          require(existingConfigOption.exists(!_.enabled), s"Cannot delete enabled cluster : $clusterName")
-
-          for {
-            existingConfig <- existingConfigOption
-          } yield {
-            val zkpath = getConfigsZkPath(existingConfig)
-            require(kafkaManagerPathCache.getCurrentData(zkpath) != null,
-              s"Cannot delete non-existing cluster : $clusterName")
-
-            //mark for deletion
-            val deleteZkPath = getDeleteClusterZkPath(existingConfig.name)
-            curator.create().creatingParentsIfNeeded().withMode(CreateMode.PERSISTENT).forPath(deleteZkPath)
-          }
-        }
+        implicit val ec = longRunningExecutionContext
+        Future {
+          KMCommandResult(Try {
+            val existingManagerOption = clusterManagerMap.get(clusterName)
+            require(existingManagerOption.isEmpty, s"Cannot delete enabled cluster : $clusterName")
+            val existingConfigOption = clusterConfigMap.get(clusterName)
+            require(existingConfigOption.isDefined, s"Cannot delete non-existing cluster : $clusterName")
+            require(existingConfigOption.exists(!_.enabled), s"Cannot delete enabled cluster : $clusterName")
+            deletingClusters += clusterName
+            clusterConfigMap -= clusterName
+            pendingClusterConfigMap -= clusterName
+            persistClusters()
+          })
+        } pipeTo sender()
 
       case KMClusterCommandRequest(clusterName, request) =>
         clusterManagerMap.get(clusterName).fold[Unit] {
@@ -376,39 +312,24 @@ class KafkaManagerActor(kafkaManagerConfig: KafkaManagerActorConfig)
     }
   }
 
-  private[this] def getDeleteClusterZkPath(clusterName: String) : String = {
-    zkPathFrom(deleteClustersZkPath,clusterName)
-  }
-
-  private[this] def getConfigsZkPath(clusterConfig: ClusterConfig) : String = {
-    zkPathFrom(configsZkPath,clusterConfig.name)
-  }
-
-  private[this] def getClusterZkPath(clusterConfig: ClusterConfig) : String = {
-    zkPathFrom(baseClusterZkPath,clusterConfig.name)
-  }
-
-  private[this] def markPendingClusterManager(clusterConfig: ClusterConfig) : Unit = {
-    implicit val ec = context.system.dispatcher
+  private[this] def markPendingClusterManager(clusterConfig: ClusterConfig): Unit = {
     log.info(s"Mark pending cluster manager $clusterConfig")
     pendingClusterConfigMap += (clusterConfig.name -> clusterConfig)
   }
 
-  private[this] def removeClusterManager(clusterConfig: ClusterConfig) : Unit = {
+  private[this] def removeClusterManager(clusterConfig: ClusterConfig): Unit = {
     implicit val ec = context.system.dispatcher
     clusterManagerMap.get(clusterConfig.name).foreach { actorPath =>
       log.info(s"Removing cluster manager $clusterConfig")
       val selection = context.actorSelection(actorPath)
-      selection.tell(CMShutdown,self)
-
-      //this is non-blocking
-      selection.resolveOne(1 seconds).foreach( ref => context.stop(ref) )
+      selection.tell(CMShutdown, self)
+      selection.resolveOne(1 seconds).foreach(ref => context.stop(ref))
     }
     clusterManagerMap -= clusterConfig.name
     clusterConfigMap -= clusterConfig.name
   }
 
-  private[this] def getConfigWithDefaults(config: ClusterConfig, kmConfig: KafkaManagerActorConfig) : ClusterConfig = {
+  private[this] def getConfigWithDefaults(config: ClusterConfig, kmConfig: KafkaManagerActorConfig): ClusterConfig = {
     val brokerViewUpdatePeriodSeconds = config.tuning.flatMap(_.brokerViewUpdatePeriodSeconds) orElse kmConfig.defaultTuning.brokerViewUpdatePeriodSeconds
     val clusterManagerThreadPoolSize = config.tuning.flatMap(_.clusterManagerThreadPoolSize) orElse kmConfig.defaultTuning.clusterManagerThreadPoolSize
     val clusterManagerThreadPoolQueueSize = config.tuning.flatMap(_.clusterManagerThreadPoolQueueSize) orElse kmConfig.defaultTuning.clusterManagerThreadPoolQueueSize
@@ -428,35 +349,31 @@ class KafkaManagerActor(kafkaManagerConfig: KafkaManagerActorConfig)
     val kafkaManagedOffsetGroupCacheSize = config.tuning.flatMap(_.kafkaManagedOffsetGroupCacheSize) orElse kmConfig.defaultTuning.kafkaManagedOffsetGroupCacheSize
     val kafkaManagedOffsetGroupExpireDays = config.tuning.flatMap(_.kafkaManagedOffsetGroupExpireDays) orElse kmConfig.defaultTuning.kafkaManagedOffsetGroupExpireDays
 
-    val tuning = Option(
-      ClusterTuning(
-        brokerViewUpdatePeriodSeconds = brokerViewUpdatePeriodSeconds
-        , clusterManagerThreadPoolSize = clusterManagerThreadPoolSize
-        , clusterManagerThreadPoolQueueSize = clusterManagerThreadPoolQueueSize
-        , kafkaCommandThreadPoolSize = kafkaCommandThreadPoolSize
-        , kafkaCommandThreadPoolQueueSize = kafkaCommandThreadPoolQueueSize
-        , logkafkaCommandThreadPoolSize = logkafkaCommandThreadPoolSize
-        , logkafkaCommandThreadPoolQueueSize = logkafkaCommandThreadPoolQueueSize
-        , logkafkaUpdatePeriodSeconds = logkafkaUpdatePeriodSeconds
-        , partitionOffsetCacheTimeoutSecs = partitionOffsetCacheTimeoutSecs
-        , brokerViewThreadPoolSize = brokerViewThreadPoolSize
-        , brokerViewThreadPoolQueueSize = brokerViewThreadPoolQueueSize
-        , offsetCacheThreadPoolSize = offsetCacheThreadPoolSize
-        , offsetCacheThreadPoolQueueSize = offsetCacheThreadPoolQueueSize
-        , kafkaAdminClientThreadPoolSize = kafkaAdminClientThreadPoolSize
-        , kafkaAdminClientThreadPoolQueueSize = kafkaAdminClientThreadPoolQueueSize
-        , kafkaManagedOffsetMetadataCheckMillis = kafkaManagedOffsetMetadataCheckMillis
-        , kafkaManagedOffsetGroupCacheSize = kafkaManagedOffsetGroupCacheSize
-        , kafkaManagedOffsetGroupExpireDays = kafkaManagedOffsetGroupExpireDays
-      )
-    )
-    config.copy(
-      tuning = tuning
-    )
+    config.copy(tuning = Option(ClusterTuning(
+      brokerViewUpdatePeriodSeconds = brokerViewUpdatePeriodSeconds
+      , clusterManagerThreadPoolSize = clusterManagerThreadPoolSize
+      , clusterManagerThreadPoolQueueSize = clusterManagerThreadPoolQueueSize
+      , kafkaCommandThreadPoolSize = kafkaCommandThreadPoolSize
+      , kafkaCommandThreadPoolQueueSize = kafkaCommandThreadPoolQueueSize
+      , logkafkaCommandThreadPoolSize = logkafkaCommandThreadPoolSize
+      , logkafkaCommandThreadPoolQueueSize = logkafkaCommandThreadPoolQueueSize
+      , logkafkaUpdatePeriodSeconds = logkafkaUpdatePeriodSeconds
+      , partitionOffsetCacheTimeoutSecs = partitionOffsetCacheTimeoutSecs
+      , brokerViewThreadPoolSize = brokerViewThreadPoolSize
+      , brokerViewThreadPoolQueueSize = brokerViewThreadPoolQueueSize
+      , offsetCacheThreadPoolSize = offsetCacheThreadPoolSize
+      , offsetCacheThreadPoolQueueSize = offsetCacheThreadPoolQueueSize
+      , kafkaAdminClientThreadPoolSize = kafkaAdminClientThreadPoolSize
+      , kafkaAdminClientThreadPoolQueueSize = kafkaAdminClientThreadPoolQueueSize
+      , kafkaManagedOffsetMetadataCheckMillis = kafkaManagedOffsetMetadataCheckMillis
+      , kafkaManagedOffsetGroupCacheSize = kafkaManagedOffsetGroupCacheSize
+      , kafkaManagedOffsetGroupExpireDays = kafkaManagedOffsetGroupExpireDays
+    )))
   }
+
   private[this] def addCluster(config: ClusterConfig): Try[Boolean] = {
     Try {
-      if(!config.enabled) {
+      if (!config.enabled) {
         log.info("Not adding cluster manager for disabled cluster : {}", config.name)
         clusterConfigMap += (config.name -> config)
         pendingClusterConfigMap -= config.name
@@ -465,11 +382,8 @@ class KafkaManagerActor(kafkaManagerConfig: KafkaManagerActorConfig)
         log.info("Adding new cluster manager for cluster : {}", config.name)
         val clusterManagerConfig = ClusterManagerActorConfig(
           kafkaManagerConfig.pinnedDispatcherName
-          , getClusterZkPath(config)
-          , kafkaManagerConfig.curatorConfig
           , config
           , askTimeoutMillis = kafkaManagerConfig.clusterActorsAskTimeoutMillis
-          , mutexTimeoutMillis = kafkaManagerConfig.mutexTimeoutMillis
           , simpleConsumerSocketTimeoutMillis = kafkaManagerConfig.simpleConsumerSocketTimeoutMillis
           , consumerProperties = kafkaManagerConfig.consumerProperties
         )
@@ -485,7 +399,7 @@ class KafkaManagerActor(kafkaManagerConfig: KafkaManagerActorConfig)
 
   private[this] def updateCluster(currentConfig: ClusterConfig, newConfig: ClusterConfig): Try[Boolean] = {
     Try {
-      if(newConfig.curatorConfig.zkConnect == currentConfig.curatorConfig.zkConnect
+      if (newConfig.bootstrapServers == currentConfig.bootstrapServers
         && newConfig.enabled == currentConfig.enabled
         && newConfig.version == currentConfig.version
         && newConfig.jmxEnabled == currentConfig.jmxEnabled
@@ -502,12 +416,10 @@ class KafkaManagerActor(kafkaManagerConfig: KafkaManagerActorConfig)
         && newConfig.saslMechanism == currentConfig.saslMechanism
         && newConfig.jaasConfig == currentConfig.jaasConfig
       ) {
-        //nothing changed
         false
       } else {
-        //only need to shutdown enabled cluster
         log.info("Updating cluster manager for cluster={} , old={}, new={}",
-          currentConfig.name,currentConfig,newConfig)
+          currentConfig.name, currentConfig, newConfig)
         markPendingClusterManager(newConfig)
         removeClusterManager(currentConfig)
         true
@@ -516,37 +428,24 @@ class KafkaManagerActor(kafkaManagerConfig: KafkaManagerActorConfig)
   }
 
   private[this] def updateState(): Unit = {
-    log.info("Updating internal state...")
-    val result = Try {
-      kafkaManagerPathCache.getCurrentData.asScala.foreach { data =>
-        ClusterConfig.deserialize(data.getData) match {
-          case Failure(t) =>
-            log.error("Failed to deserialize cluster config",t)
-          case Success(newConfig) =>
-            val configWithDefaults = getConfigWithDefaults(newConfig, kafkaManagerConfig)
-            clusterConfigMap.get(newConfig.name).fold(addCluster(configWithDefaults))(updateCluster(_,configWithDefaults))
-        }
-      }
-    }
-    result match {
-      case Failure(t) =>
-        log.error("Failed to update internal state ... ",t)
-      case _ =>
+    log.debug("Updating internal state from file...")
+    val loaded = loadClustersFromFile()
+    loaded.values.foreach { newConfig =>
+      val configWithDefaults = getConfigWithDefaults(newConfig, kafkaManagerConfig)
+      clusterConfigMap.get(newConfig.name)
+        .fold(addCluster(configWithDefaults))(updateCluster(_, configWithDefaults))
     }
     lastUpdateMillis = System.currentTimeMillis()
   }
 
   private[this] def pruneClusters(): Unit = {
-    log.info("Pruning clusters...")
-    Try {
-      val localClusterConfigMap = clusterConfigMap
-      localClusterConfigMap.foreach { case (name, clusterConfig) =>
-        val zkpath : String = getConfigsZkPath(clusterConfig)
-        if(kafkaManagerPathCache.getCurrentData(zkpath) == null) {
-          pendingClusterConfigMap -= clusterConfig.name
-          removeClusterManager(clusterConfig)
-          clusterConfigMap -= name
-        }
+    log.debug("Pruning clusters...")
+    val loaded = loadClustersFromFile()
+    clusterConfigMap.foreach { case (name, clusterConfig) =>
+      if (!loaded.contains(name)) {
+        pendingClusterConfigMap -= clusterConfig.name
+        removeClusterManager(clusterConfig)
+        clusterConfigMap -= name
       }
     }
     lastUpdateMillis = System.currentTimeMillis()

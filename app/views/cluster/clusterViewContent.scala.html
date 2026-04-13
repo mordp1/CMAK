@@ -12,7 +12,7 @@
         <tbody>
         @features.app(features.KMClusterManagerFeature) {
         <tr>
-            <td><b>Zookeepers</b></td><td>@clusterView.clusterContext.config.curatorConfig.zkConnect.replace(","," ")</td>
+            <td><b>Bootstrap Servers</b></td><td>@clusterView.clusterContext.config.bootstrapServers.replace(","," ")</td>
         </tr>
         }
         <tr>

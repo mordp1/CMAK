@@ -65,16 +65,14 @@ class KafkaManager(akkaConfig: Config) extends Logging {
   def getPrefixedKey(key: String): String = if (akkaConfig.hasPathOrNull(s"cmak.$key")) s"cmak.$key" else s"kafka-manager.$key"
 
   val ConsumerPropertiesFile = getPrefixedKey("consumer.properties.file")
-  val BaseZkPath = getPrefixedKey("base-zk-path")
+  val ClusterConfigFile = "cmak.cluster-config-file"
   val PinnedDispatchName = getPrefixedKey("pinned-dispatcher-name")
-  val ZkHosts = getPrefixedKey("zkhosts")
   val BrokerViewUpdateSeconds = getPrefixedKey("broker-view-update-seconds")
   val KafkaManagerUpdateSeconds = getPrefixedKey("kafka-manager-update-seconds")
   val DeleteClusterUpdateSeconds = getPrefixedKey("delete-cluster-update-seconds")
   val DeletionBatchSize = getPrefixedKey("deletion-batch-size")
   val MaxQueueSize = getPrefixedKey("max-queue-size")
   val ThreadPoolSize = getPrefixedKey("thread-pool-size")
-  val MutexTimeoutMillis = getPrefixedKey("mutex-timeout-millis")
   val StartDelayMillis = getPrefixedKey("start-delay-millis")
   val ApiTimeoutMillis = getPrefixedKey("api-timeout-millis")
   val ClusterActorsAskTimeoutMillis = getPrefixedKey("cluster-actors-ask-timeout-millis")
@@ -92,7 +90,6 @@ class KafkaManager(akkaConfig: Config) extends Logging {
 
   val DefaultConfig: Config = {
     val defaults: Map[String, _ <: AnyRef] = Map(
-      BaseZkPath -> KafkaManagerActor.ZkRoot,
       PinnedDispatchName -> "pinned-dispatcher",
       BrokerViewUpdateSeconds -> "30",
       KafkaManagerUpdateSeconds -> "10",
@@ -100,7 +97,6 @@ class KafkaManager(akkaConfig: Config) extends Logging {
       DeletionBatchSize -> "2",
       MaxQueueSize -> "100",
       ThreadPoolSize -> "2",
-      MutexTimeoutMillis -> "4000",
       StartDelayMillis -> "1000",
       ApiTimeoutMillis -> "5000",
       ClusterActorsAskTimeoutMillis -> "2000",
@@ -144,14 +140,15 @@ class KafkaManager(akkaConfig: Config) extends Logging {
     , kafkaManagedOffsetGroupExpireDays = Option(configWithDefaults.getInt(KafkaManagedOffsetGroupExpireDays))
   )
   private[this] val kafkaManagerConfig = {
-    val curatorConfig = CuratorConfig(configWithDefaults.getString(ZkHosts))
+    val clusterConfigFile = if (configWithDefaults.hasPath(ClusterConfigFile))
+      configWithDefaults.getString(ClusterConfigFile)
+    else
+      s"${System.getProperty("user.dir")}/conf/cmak-clusters.json"
     KafkaManagerActorConfig(
-      curatorConfig = curatorConfig
-      , baseZkPath = configWithDefaults.getString(BaseZkPath)
+      clusterConfigFile = clusterConfigFile
       , pinnedDispatcherName = configWithDefaults.getString(PinnedDispatchName)
       , startDelayMillis = configWithDefaults.getLong(StartDelayMillis)
       , threadPoolSize = configWithDefaults.getInt(ThreadPoolSize)
-      , mutexTimeoutMillis = configWithDefaults.getInt(MutexTimeoutMillis)
       , maxQueueSize = configWithDefaults.getInt(MaxQueueSize)
       , kafkaManagerUpdatePeriod = FiniteDuration(configWithDefaults.getInt(KafkaManagerUpdateSeconds), SECONDS)
       , deleteClusterUpdatePeriod = FiniteDuration(configWithDefaults.getInt(DeleteClusterUpdateSeconds), SECONDS)

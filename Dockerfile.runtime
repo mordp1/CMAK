@@ -1,0 +1,7 @@
+FROM eclipse-temurin:11-jre-jammy
+RUN apt-get update && apt-get install -y --no-install-recommends unzip && rm -rf /var/lib/apt/lists/*
+ADD target/universal/cmak-3.0.1.zip /opt/cmak.zip
+WORKDIR /opt
+RUN unzip cmak.zip && rm -f cmak.zip
+EXPOSE 9000
+CMD ["/opt/cmak-3.0.1/bin/cmak"]

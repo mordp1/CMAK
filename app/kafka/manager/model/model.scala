@@ -164,6 +164,38 @@ case object Kafka_3_2_0 extends KafkaVersion {
   override def toString = "3.2.0"
 }
 
+case object Kafka_3_3_0 extends KafkaVersion {
+  override def toString = "3.3.0"
+}
+
+case object Kafka_3_4_0 extends KafkaVersion {
+  override def toString = "3.4.0"
+}
+
+case object Kafka_3_5_0 extends KafkaVersion {
+  override def toString = "3.5.0"
+}
+
+case object Kafka_3_6_0 extends KafkaVersion {
+  override def toString = "3.6.0"
+}
+
+case object Kafka_3_7_0 extends KafkaVersion {
+  override def toString = "3.7.0"
+}
+
+case object Kafka_3_8_0 extends KafkaVersion {
+  override def toString = "3.8.0"
+}
+
+case object Kafka_4_0_0 extends KafkaVersion {
+  override def toString = "4.0.0"
+}
+
+case object Kafka_4_1_0 extends KafkaVersion {
+  override def toString = "4.1.0"
+}
+
 object KafkaVersion {
   val supportedVersions: Map[String,KafkaVersion] = Map(
     "0.8.1.1" -> Kafka_0_8_1_1,
@@ -204,7 +236,15 @@ object KafkaVersion {
     "3.0.0" -> Kafka_3_0_0,
     "3.1.0" -> Kafka_3_1_0,
     "3.1.1" -> Kafka_3_1_1,
-    "3.2.0" -> Kafka_3_2_0
+    "3.2.0" -> Kafka_3_2_0,
+    "3.3.0" -> Kafka_3_3_0,
+    "3.4.0" -> Kafka_3_4_0,
+    "3.5.0" -> Kafka_3_5_0,
+    "3.6.0" -> Kafka_3_6_0,
+    "3.7.0" -> Kafka_3_7_0,
+    "3.8.0" -> Kafka_3_8_0,
+    "4.0.0" -> Kafka_4_0_0,
+    "4.1.0" -> Kafka_4_1_0
   )
 
   val formSelectList : IndexedSeq[(String,String)] = supportedVersions.toIndexedSeq.filterNot(_._1.contains("beta")).map(t => (t._1,t._2.toString)).sortWith((a, b) => sortVersion(a._1, b._1))
@@ -253,14 +293,16 @@ object ClusterConfig {
     }
   }
 
-  def validateZkHosts(zkHosts: String): Unit = {
-    require(zkHosts.length > 0, "cluster zk hosts is illegal, can't be empty!")
+  def validateBootstrapServers(bootstrapServers: String): Unit = {
+    require(bootstrapServers.length > 0, "Bootstrap servers cannot be empty!")
   }
+
+  // kept for backward compatibility with old serialized data
+  def validateZkHosts(zkHosts: String): Unit = validateBootstrapServers(zkHosts)
 
   def apply(name: String
             , version : String
-            , zkHosts: String
-            , zkMaxRetry: Int = 10
+            , bootstrapServers: String
             , jmxEnabled: Boolean
             , jmxUser: Option[String]
             , jmxPass: Option[String]
@@ -278,12 +320,12 @@ object ClusterConfig {
     val kafkaVersion = KafkaVersion(version)
     //validate cluster name
     validateName(name)
-    //validate zk hosts
-    validateZkHosts(zkHosts)
-    val cleanZkHosts = zkHosts.replaceAll(" ","")
+    //validate bootstrap servers
+    validateBootstrapServers(bootstrapServers)
+    val cleanBootstrapServers = bootstrapServers.replaceAll(" ","")
     new ClusterConfig(
       name
-      , CuratorConfig(cleanZkHosts, zkMaxRetry)
+      , cleanBootstrapServers
       , true
       , kafkaVersion
       , jmxEnabled
@@ -299,13 +341,14 @@ object ClusterConfig {
       , SecurityProtocol(securityProtocol)
       , saslMechanism.flatMap(SASLmechanism.from)
       , jaasConfig
+      , 9999
     )
   }
 
   def customUnapply(cc: ClusterConfig) : Option[(
-    String, String, String, Int, Boolean, Option[String], Option[String], Boolean, Boolean, Boolean, Boolean, Boolean, Boolean, Option[ClusterTuning], String, Option[String], Option[String])] = {
+    String, String, String, Boolean, Option[String], Option[String], Boolean, Boolean, Boolean, Boolean, Boolean, Boolean, Option[ClusterTuning], String, Option[String], Option[String])] = {
     Some((
-      cc.name, cc.version.toString, cc.curatorConfig.zkConnect, cc.curatorConfig.zkMaxRetry,
+      cc.name, cc.version.toString, cc.bootstrapServers,
       cc.jmxEnabled, cc.jmxUser, cc.jmxPass, cc.jmxSsl, cc.pollConsumers, cc.filterConsumers,
       cc.logkafkaEnabled, cc.activeOffsetCacheEnabled, cc.displaySizeEnabled, cc.tuning, cc.securityProtocol.stringId, cc.saslMechanism.map(_.stringId), cc.jaasConfig
       )
@@ -337,7 +380,7 @@ object ClusterConfig {
 
   def serialize(config: ClusterConfig) : Array[Byte] = {
     val json = makeObj(("name" -> toJSON(config.name))
-      :: ("curatorConfig" -> toJSON(config.curatorConfig))
+      :: ("bootstrapServers" -> toJSON(config.bootstrapServers))
       :: ("enabled" -> toJSON(config.enabled))
       :: ("kafkaVersion" -> toJSON(config.version.toString))
       :: ("jmxEnabled" -> toJSON(config.jmxEnabled))
@@ -353,6 +396,7 @@ object ClusterConfig {
       :: ("securityProtocol" -> toJSON(config.securityProtocol.stringId))
       :: ("saslMechanism" -> toJSON(config.saslMechanism.map(_.stringId)))
       :: ("jaasConfig" -> toJSON(config.jaasConfig))
+      :: ("jmxPort" -> toJSON(config.jmxPort))
       :: Nil)
     compact(render(json)).getBytes(StandardCharsets.UTF_8)
   }
@@ -361,9 +405,15 @@ object ClusterConfig {
     Try {
       val json = parse(kafka.manager.utils.deserializeString(ba))
 
-      val result = (fieldExtended[String]("name")(json) |@| fieldExtended[CuratorConfig]("curatorConfig")(json) |@| fieldExtended[Boolean]("enabled")(json))
+      val result = (fieldExtended[String]("name")(json) |@| fieldExtended[Boolean]("enabled")(json))
       {
-        (name:String,curatorConfig:CuratorConfig,enabled:Boolean) =>
+        (name:String, enabled:Boolean) =>
+          // Support new bootstrapServers field; fall back to old curatorConfig.zkConnect for migration
+          val bootstrapServers = fieldExtended[String]("bootstrapServers")(json)
+            .getOrElse(
+              fieldExtended[CuratorConfig]("curatorConfig")(json)
+                .map(_.zkConnect).getOrElse("")
+            )
           val versionString = fieldExtended[String]("kafkaVersion")(json)
           val version = versionString.map(KafkaVersion.apply).getOrElse(Kafka_0_8_1_1)
           val jmxEnabled = fieldExtended[Boolean]("jmxEnabled")(json)
@@ -381,11 +431,13 @@ object ClusterConfig {
           val saslMechanismString = fieldExtended[Option[String]]("saslMechanism")(json)
           val saslMechanism = saslMechanismString.map(_.flatMap(SASLmechanism.from))
           val jaasConfig = fieldExtended[Option[String]]("jaasConfig")(json)
+          val jmxPort = fieldExtended[Int]("jmxPort")(json)
 
-          ClusterConfig.apply(
+          ClusterConfig(
             name,
-            curatorConfig,
-            enabled,version,
+            bootstrapServers,
+            enabled,
+            version,
             jmxEnabled.getOrElse(false),
             jmxUser.getOrElse(None),
             jmxPass.getOrElse(None),
@@ -398,7 +450,8 @@ object ClusterConfig {
             clusterTuning.getOrElse(None),
             securityProtocol,
             saslMechanism.getOrElse(None),
-            jaasConfig.getOrElse(None)
+            jaasConfig.getOrElse(None),
+            jmxPort.getOrElse(9999)
           )
       }
 
@@ -515,7 +568,7 @@ object ClusterTuning {
 
 case class ClusterContext(clusterFeatures: ClusterFeatures, config: ClusterConfig)
 case class ClusterConfig (name: String
-                          , curatorConfig : CuratorConfig
+                          , bootstrapServers : String
                           , enabled: Boolean
                           , version: KafkaVersion
                           , jmxEnabled: Boolean
@@ -531,6 +584,7 @@ case class ClusterConfig (name: String
                           , securityProtocol: SecurityProtocol
                           , saslMechanism: Option[SASLmechanism]
                           , jaasConfig: Option[String]
+                          , jmxPort: Int
                          )
 
 sealed trait SecurityProtocol {

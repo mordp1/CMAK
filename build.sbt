@@ -5,7 +5,7 @@
 name := """cmak"""
 
 /* For packaging purposes, -SNAPSHOT MUST contain a digit */
-version := "3.0.0.7"
+version := "3.0.1"
 
 scalaVersion := "2.12.10"
 
@@ -33,6 +33,7 @@ libraryDependencies ++= Seq(
   "org.webjars" % "underscorejs" % "1.9.0",
   "org.webjars" % "dustjs-linkedin" % "2.7.2",
   "org.webjars" % "octicons" % "4.3.0",
+  // Curator kept for compilation of legacy utility files (AdminUtils, ZkUtils, logkafka) — not used at runtime in KRaft mode
   "org.apache.curator" % "curator-framework" % "2.12.0" exclude("log4j","log4j") exclude("org.slf4j", "slf4j-log4j12") force(),
   "org.apache.curator" % "curator-recipes" % "2.12.0" exclude("log4j","log4j") exclude("org.slf4j", "slf4j-log4j12") force(),
   "org.json4s" %% "json4s-jackson" % "3.6.5",
@@ -41,13 +42,13 @@ libraryDependencies ++= Seq(
   "com.adrianhurt" %% "play-bootstrap" % "1.4-P26-B4" exclude("com.typesafe.play", "*"),
   "org.clapper" %% "grizzled-slf4j" % "1.3.3",
   "org.apache.kafka" %% "kafka" % "2.4.1" exclude("log4j","log4j") exclude("org.slf4j", "slf4j-log4j12") force(),
-  "org.apache.kafka" % "kafka-streams" % "2.2.0",
+  "org.apache.kafka" % "kafka-clients" % "2.4.1",
   "com.beachape" %% "enumeratum" % "1.5.13",
   "com.github.ben-manes.caffeine" % "caffeine" % "2.6.2",
   "com.typesafe.play" %% "play-logback" % "2.6.21",
   "org.scalatest" %% "scalatest" % "3.0.5" % "test",
   "org.scalatestplus.play" %% "scalatestplus-play" % "3.1.2" % "test",
-  "org.apache.curator" % "curator-test" % "2.12.0" % "test",
+  // curator-test kept for any remaining ZK-based tests
   "org.mockito" % "mockito-core" % "1.10.19" % "test",
   "com.yammer.metrics" % "metrics-core" % "2.2.0" force(),
   "com.unboundid" % "unboundid-ldapsdk" % "4.0.9"
